@@ -1,1 +1,208 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+# System Backup Script
+# - Archives selected system configuration and application data
+# - Generates a SHA-256 checksum for each archive
+# - Removes old backups according to the retention period
+# - Supports dry-run mode
+
+DRY_RUN=false
+BACKUP_DIR="/var/backups/system-backup"
+RETENTION_DAYS=7
+
+# Directories to back up, relative to /
+BACKUP_PATHS=(
+    etc
+    home
+    root
+    var/www
+    opt
+    srv
+)
+
+usage() {
+    cat <<EOF
+Usage: $0 [OPTIONS]
+
+Options:
+  --dry-run                 Preview actions without changing files
+  --destination DIR         Backup destination directory
+  --retention DAYS          Number of days to retain backups
+  --help, -h                Show this help message
+
+Examples:
+  $0 --dry-run
+  $0 --destination /mnt/backups
+  $0 --retention 14
+EOF
+}
+
+log() {
+    printf '[INFO] %s\n' "$*"
+}
+
+error() {
+    printf '[ERROR] %s\n' "$*" >&2
+}
+
+run() {
+    if [[ "$DRY_RUN" == true ]]; then
+        printf '[DRY-RUN] '
+        printf '%q ' "$@"
+        printf '\n'
+    else
+        "$@"
+    fi
+}
+
+# Parse arguments
+while (($#)); do
+    case "$1" in
+        --dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        --destination)
+            if (($# < 2)) || [[ -z "$2" || "$2" == -* ]]; then
+                error "--destination requires a directory."
+                exit 2
+            fi
+            BACKUP_DIR="$2"
+            shift 2
+            ;;
+        --retention)
+            if (($# < 2)) || [[ ! "$2" =~ ^[1-9][0-9]*$ ]]; then
+                error "--retention requires a positive number of days."
+                exit 2
+            fi
+            RETENTION_DAYS="$2"
+            shift 2
+            ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        *)
+            error "Unknown option: $1"
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
+
+# Require root for a real backup.
+if [[ "$DRY_RUN" != true && "$EUID" -ne 0 ]]; then
+    error "Run this script as root or with sudo."
+    exit 1
+fi
+
+# Validate required commands.
+for cmd in tar gzip sha256sum find date realpath flock; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        error "Required command not found: $cmd"
+        exit 1
+    fi
+done
+
+# Resolve the destination to an absolute path.
+if [[ "$DRY_RUN" == true ]]; then
+    BACKUP_DIR="$(realpath -m -- "$BACKUP_DIR")"
+else
+    mkdir -p -- "$BACKUP_DIR"
+    BACKUP_DIR="$(realpath -- "$BACKUP_DIR")"
+fi
+
+# Prevent archives from being stored inside a directory
+# that this script is backing up.
+for path in "${BACKUP_PATHS[@]}"; do
+    case "$BACKUP_DIR/" in
+        "/$path/"*)
+            error "Backup destination must not be inside /$path."
+            exit 1
+            ;;
+    esac
+done
+
+# Select existing backup paths.
+EXISTING_PATHS=()
+
+for path in "${BACKUP_PATHS[@]}"; do
+    if [[ -e "/$path" ]]; then
+        EXISTING_PATHS+=("$path")
+    else
+        log "Skipping missing directory: /$path"
+    fi
+done
+
+if ((${#EXISTING_PATHS[@]} == 0)); then
+    error "No directories are available to back up."
+    exit 1
+fi
+
+TIMESTAMP="$(date '+%Y-%m-%d_%H-%M-%S')"
+ARCHIVE="$BACKUP_DIR/system-backup-$TIMESTAMP.tar.gz"
+CHECKSUM="$ARCHIVE.sha256"
+
+log "Starting system backup"
+log "Destination: $BACKUP_DIR"
+log "Retention: $RETENTION_DAYS days"
+
+# Prevent overlapping backups.
+if [[ "$DRY_RUN" != true ]]; then
+    exec 9>"$BACKUP_DIR/.system-backup.lock"
+
+    if ! flock -n 9; then
+        error "Another backup process is already running."
+        exit 1
+    fi
+fi
+
+# Create the compressed archive.
+log "Creating backup archive"
+
+run tar \
+    --create \
+    --gzip \
+    --file="$ARCHIVE" \
+    --directory=/ \
+    "${EXISTING_PATHS[@]}"
+
+if [[ "$DRY_RUN" != true ]]; then
+    # Generate a checksum only after the archive succeeds.
+    sha256sum "$ARCHIVE" > "$CHECKSUM"
+    log "Archive created: $ARCHIVE"
+    log "Checksum created: $CHECKSUM"
+fi
+
+# Remove backups older than the retention period.
+log "Checking for expired backups"
+
+if [[ "$DRY_RUN" == true ]]; then
+    find "$BACKUP_DIR" \
+        -maxdepth 1 \
+        -type f \
+        -name 'system-backup-*.tar.gz' \
+        -mtime "+$RETENTION_DAYS" \
+        -print 2>/dev/null || true
+else
+    while IFS= read -r -d '' old_archive; do
+        log "Removing expired backup: $old_archive"
+        rm -f -- "$old_archive" "$old_archive.sha256"
+    done < <(
+        find "$BACKUP_DIR" \
+            -maxdepth 1 \
+            -type f \
+            -name 'system-backup-*.tar.gz' \
+            -mtime "+$RETENTION_DAYS" \
+            -print0
+    )
+fi
+
+if [[ "$DRY_RUN" == true ]]; then
+    log "Dry run complete; no backup was created."
+else
+    log "System backup completed successfully."
+fi
 
